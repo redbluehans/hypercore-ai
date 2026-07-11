@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>HyperCore AI — Panel</title>
+<style>
+  body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:0;padding:24px}
+  h1{font-size:20px} h2{font-size:15px;color:#7ee787;margin-top:28px}
+  input,select,button{background:#161b22;color:#e6edf3;border:1px solid #30363d;padding:6px;margin:2px;border-radius:6px}
+  button{cursor:pointer} table{width:100%;border-collapse:collapse;margin-top:8px}
+  td,th{border-bottom:1px solid #30363d;padding:6px;text-align:left;font-size:13px}
+  pre{background:#161b22;padding:10px;border-radius:6px;overflow:auto;font-size:12px}
+  .ok{color:#7ee787} .bad{color:#f85149}
+</style>
+</head>
+<body>
+<h1>HyperCore AI — Panel de Control (Fase 4)</h1>
+
+<h2>1. Fleet — crear y listar agentes</h2>
+name: <input id="name" value="researcher-1">
+capabilities (coma): <input id="caps" value="researcher">
+budget_usd: <input id="budget" value="1.0" style="width:60px">
+<button onclick="createAgent()">Crear</button>
+<button onclick="refresh()">Refrescar lista</button>
+<table id="agentsTable"><tr><th>id</th><th>name</th><th>state</th><th>caps</th><th>acciones</th></tr></table>
+
+<h2>2. Comunicación entre agentes</h2>
+sender_id: <input id="senderId">
+target_id: <input id="targetId">
+target_cap: <input id="targetCap" value="writer">
+mode: <select id="mode"><option>async</option><option>sync</option></select>
+texto: <input id="text" value="hallazgo de prueba">
+<button onclick="sendMsg()">Enviar</button>
+<button onclick="tick()">Tick (despertar destino)</button>
+<pre id="commOut"></pre>
+
+<h2>3. Auditoría (hash-chain)</h2>
+agent_id: <input id="auditId">
+<button onclick="audit()">Ver auditoría</button>
+<pre id="auditOut"></pre>
+
+<script>
+const API = "http://localhost:8080";
+
+async function refresh(){
+  const r = await fetch(API+"/v1/agents"); const d = await r.json();
+  const t = document.getElementById("agentsTable");
+  t.innerHTML = "<tr><th>id</th><th>name</th><th>state</th><th>caps</th><th>acciones</th></tr>";
+  d.agents.forEach(a=>{
+    t.innerHTML += `<tr><td>${a.id}</td><td>${a.name}</td><td>${a.state}</td><td>${a.capabilities}</td>
+      <td><button onclick="act('${a.id}','activate')">activate</button>
+      <button onclick="act('${a.id}','pause')">pause</button></td></tr>`;
+  });
+}
+async function createAgent(){
+  await fetch(API+"/v1/agents",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name:document.getElementById("name").value,
+      capabilities:document.getElementById("caps").value.split(","),
+      token_budget_per_hour:50000, budget_usd:parseFloat(document.getElementById("budget").value)})});
+  refresh();
+}
+async function act(id,action){
+  await fetch(`${API}/v1/agents/${id}:${action}`,{method:"POST"}); refresh();
+}
+async function sendMsg(){
+  const r = await fetch(API+"/v1/send",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({sender_id:senderId.value,target_id:targetId.value,
+      target_cap:targetCap.value,mode:mode.value,text:text.value,max_tokens:1000})});
+  document.getElementById("commOut").textContent = JSON.stringify(await r.json(),null,2);
+}
+async function tick(){
+  const r = await fetch(API+"/v1/tick",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({agent_id:targetId.value})});
+  document.getElementById("commOut").textContent = JSON.stringify(await r.json(),null,2);
+}
+async function audit(){
+  const r = await fetch(`${API}/v1/agents/${auditId.value}/audit`);
+  const d = await r.json();
+  document.getElementById("auditOut").innerHTML =
+    `<span class="${d.chain_ok?'ok':'bad'}">cadena íntegra: ${d.chain_ok}</span>\n` + JSON.stringify(d.log,null,2);
+}
+refresh();
+</script>
+</body>
+</html>

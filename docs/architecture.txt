@@ -1,0 +1,459 @@
+# HyperCore AI — Documento de Arquitectura v0.1
+
+**Estado:** Diseño de núcleo cerrado, pendiente de piezas de producto/operación.
+**Fecha:** Julio 2026
+
+---
+
+## 1. Visión
+
+Plataforma de infraestructura para ejecutar, aislar, gobernar y coordinar cientos/miles de agentes de IA, comparable conceptualmente a Kubernetes/Docker/VMware pero orientada exclusivamente a agentes de IA — no un framework de orquestación de prompts ni un wrapper de LLM.
+
+**Decisión fundacional:** HyperCore es **standalone**, no construido sobre Kubernetes. Se acepta el costo de reconstruir scheduling/networking/HA propios a cambio de un modelo de recursos nativo para agentes (tokens, memoria semántica, permisos entre agentes) que K8s no modela bien.
+
+**Caso de uso guía del MVP:** colaboración multi-agente con control de permisos entre ellos (no un solo agente aislado a escala, no marketplace, no GPU scheduling todavía).
+
+---
+
+## 2. Principio transversal de gobernanza
+
+> **Fail-fast, fail-visible, never fail-silent-with-automation.**
+
+Todo componente de control (Permission Engine, Memory Plane, Cost Governor) deniega con error explícito e inmediato al agente que solicitó la acción. Nunca hay auto-retry, auto-degradación ni pausa-y-espera-humano automática. El agente que recibe el error decide su propia lógica. Esto mantiene un contrato de error único y predecible en todo el sistema, y un Audit Log 100% consistente.
+
+---
+
+## 3. Arquitectura general
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AGENT CONTROL PLANE (ACP)                 │
+│  - Agent Registry (identidad, spec, versión)                 │
+│  - State Store (Postgres en MVP)                              │
+│  - Reconciliation Loop (estado deseado vs real)                │
+└───────────────────────────┬───────────────────────────────────┘
+                             │ (gRPC/eventos)
+        ┌────────────────────┼────────────────────┐
+        │                    │                     │
+┌───────▼──────┐    ┌────────▼────────┐   ┌────────▼────────┐
+│  SCHEDULER    │    │  PERMISSION      │   │  COST GOVERNOR   │
+│  (placement)  │    │  ENGINE (OPA)    │   │  (token/$ budget)│
+└───────┬──────┘    └────────┬────────┘   └────────┬────────┘
+        │                    │                     │
+┌───────▼─────────────────────────────────────────▼────────┐
+│              RUNTIME LAYER (serverless, on-demand)           │
+│  Agent Runner — 1 runner efímero = 1 agente despierto         │
+│  Aislamiento MVP: Docker. V2: Firecracker/gVisor               │
+└───────┬─────────────────────────────────────────┬─────────┘
+        │                                          │
+┌───────▼────────┐                        ┌────────▼────────┐
+│  MEMORY PLANE   │                        │  TOOL/IO PLANE   │
+│ working/episodic│                        │  (sandboxed,     │
+│ /semantic        │                        │   plugin system)  │
+└─────────────────┘                        └──────────────────┘
+        │                                          │
+        └──────────────┬───────────────────────────┘
+                        │
+              ┌─────────▼─────────┐
+              │   EVENT BUS         │
+              │ NATS JetStream       │
+              │ (persistente, audit) │
+              └─────────────────────┘
+```
+
+---
+
+## 4. Componentes y responsabilidades
+
+| Componente | Responsabilidad | Tipo |
+|---|---|---|
+| Control Plane | Fuente de verdad del estado deseado, reconciliación continua | Núcleo, Go |
+| Scheduler | Placement de runtimes en el pool de nodos | Núcleo, Go |
+| Permission Engine | Autorización de comunicación y acceso a memoria, basado en roles | Microservicio, OPA embebido |
+| Cost Governor | Reserva/débito de presupuesto de tokens, dos fases | Microservicio |
+| Agent Runner | Ejecuta el loop del agente en un proceso aislado, efímero | Núcleo + plugin (lógica del agente) |
+| Memory Plane | Almacenamiento en 3 capas, aislado por namespace | Backend plugin (Redis/Postgres/pgvector) |
+| Tool/IO Plane | Ejecución sandboxed de herramientas externas | Plugin system |
+| Event Bus | Transporte de mensajes + persistencia + fuente de auditoría | NATS JetStream |
+| Identity Service | Emisión de identidad criptográfica por agente | Microservicio (SPIFFE/SPIRE en v2) |
+| Marketplace | Registro y versionado de imágenes de agentes | Microservicio, no diseñado aún |
+| Observability | Métricas y tracing | Estándar (OTel + Prometheus), no reinventar |
+| Panel Web | UI, consume la API pública | Frontend, sin lógica propia |
+
+---
+
+## 5. Stack tecnológico
+
+| Capa | MVP | Empresarial (futuro) |
+|---|---|---|
+| Núcleo (Control Plane, Scheduler) | **Go** | Go/Rust |
+| Aislamiento de runtime | Docker | Firecracker microVM / gVisor |
+| Event Bus | NATS JetStream | Kafka (si el throughput lo exige) |
+| Memory: working | Redis (TTL corto, cache de nodo) | Redis clusterizado |
+| Memory: episodic | Postgres (append-only) | Postgres particionado |
+| Memory: semantic | pgvector | Plugin: Pinecone/Qdrant/Weaviate |
+| Permission Engine | OPA embebido | OPA + SPIFFE/SPIRE |
+| Despliegue | Docker Compose | Orquestado (decisión pendiente, no K8s por diseño) |
+
+**Justificación de Go sobre Rust:** velocidad de desarrollo del MVP, ecosistema nativo (gRPC, NATS, Docker SDK), disponibilidad de talento. Rust queda reservado para el sandbox de aislamiento si se construye uno propio en el futuro — no es cuello de botella hoy porque la llamada al LLM domina la latencia total.
+
+---
+
+## 6. El Agent Spec (manifiesto central)
+
+```yaml
+apiVersion: hypercore/v1
+kind: Agent
+metadata:
+  id: agt_7f3a
+  name: market-researcher-01
+  version: 1.2.0
+
+spec:
+  capabilities:            # SOLO el operador humano las define/aprueba
+    - researcher
+
+  identity:
+    issuer: hypercore-identity
+
+  resources:
+    cpu: "500m"
+    memory: "512Mi"
+    token_budget:
+      max_per_hour: 50000
+      provider_cost_limit_usd: 5.00
+
+  memory:
+    backend: pgvector
+    namespace: agt_7f3a
+
+  tools:
+    - name: web_search
+      sandboxed: true
+
+  communication:
+    mode: [async, sync]
+
+  runtime:
+    isolation: docker
+    image: registry.hypercore.local/agents/researcher:1.2.0
+```
+
+---
+
+## 7. Comunicación entre agentes
+
+- **Nunca directa.** Siempre mediada por Permission Engine + Event Bus.
+- **Dos modos sobre el mismo transporte (NATS):** pub/sub asíncrono y RPC (request-reply).
+- **Permisos por capability/rol**, no por par de agentes. Definidos en una `policy_matrix` gestionada por el operador humano.
+- **Naming de subjects:** `agents.<capability>.<agent_id>.<intent>`
+- El Permission Engine evalúa un único criterio: *¿puede el emisor publicar en este subject?* — no distingue sync/async a nivel de autorización.
+- **Verificación centralizada** (no distribuida a sidecars) en el MVP: prioriza auditoría estricta sobre latencia mínima.
+- Todo **deny** se audita igual que todo **allow**.
+
+---
+
+## 8. Ciclo de vida del agente
+
+Dos relojes separados — identidad persistente vs runtime efímero:
+
+```
+IDENTIDAD (persistente):
+  DRAFT → REGISTERED → ACTIVE ⇄ PAUSED → ARCHIVED
+                            └→ DEPRECATED
+
+RUNTIME (efímero, serverless, N instancias por agente en el tiempo):
+  [dormido] → PENDING → SCHEDULED → RUNNING → checkpoint → [dormido]
+                                        └→ CRASHED → retry/alert
+```
+
+- **Modelo serverless confirmado:** el runtime se crea al llegar un mensaje y se destruye tras idle-timeout. Necesario para escalar a millones de agentes sin miles de procesos idle.
+- No existe `DELETED` inmediato — `ARCHIVED` es soft-delete, por requisitos de auditoría. Hard-delete es una operación de retención de datos separada.
+- El **Control Plane opera como reconciliation loop** (declarativo, como K8s): compara estado deseado vs real cada N segundos y corrige — permite auto-sanación ante caída de nodos sin intervención manual.
+- **Cold start:** Docker (~200-500ms) aceptable en MVP porque el caso de uso es colaboración asíncrona, no chat humano en vivo. Firecracker (~125ms) es la ruta de v2 si se necesita baja latencia.
+- **JetStream (no NATS Core)** es obligatorio: los mensajes deben persistir mientras el agente destino está dormido.
+
+---
+
+## 9. Scheduler
+
+Algoritmo de placement, en orden:
+
+1. **Cost Governor gate** — rechazo temprano si no hay presupuesto, antes de gastar ciclos de scheduling.
+2. **Filtrado** — nodos con recursos suficientes y `HEALTHY` (heartbeat reciente).
+3. **Afinidad soft** — preferir el nodo de la última ejecución (cache de Working Memory). Nunca hard-requirement, para no romper la auto-sanación si el nodo cae.
+4. **Cola con prioridad** — `cola_rpc` (alta) se drena antes que `cola_pubsub` (normal), con starvation guard: pub/sub obtiene turno garantizado tras X segundos de espera.
+
+**Estrategia de bin-packing: most-allocated** (llenar un nodo antes de abrir otro), no least-allocated. Justificación: runtimes de vida corta — empaquetar permite apagar nodos vacíos (ahorro real de infraestructura), a diferencia de K8s donde los Pods son de larga duración.
+
+---
+
+## 10. Memory Plane
+
+Tres capas por agente, namespace estricto (`deny-by-default`):
+
+| Capa | Backend | Naturaleza | Compartible |
+|---|---|---|---|
+| Working | Redis, TTL corto | Contexto de tarea actual; es la cache de nodo del Scheduler | No, nunca |
+| Episodic | Postgres, append-only | Historial de eventos/decisiones, fuente de auditoría | No, nunca |
+| Semantic | pgvector | Conocimiento consolidado, embeddings | Sí, bajo permiso |
+
+- Solo la capa **Semantic** puede compartirse entre agentes.
+- **Modelo de acceso: A — lectura directa autorizada.** Si la política lo permite, un agente lee directamente el namespace semántico de otro (no hay capa de "publicación explícita" intermedia en el MVP).
+- Riesgo aceptado conscientemente: la granularidad de qué se expone la controla la política del operador, no el agente dueño de la memoria. Un modelo B (publicación explícita) queda como extensión futura no bloqueante.
+- Reutiliza el mismo Permission Engine que gobierna comunicación, con un `resource_type` adicional (`memory_read`).
+- Toda lectura cross-agent se audita en el Event Bus, igual que la comunicación.
+
+---
+
+## 11. Cost Governor
+
+Problema central: el costo real de una llamada LLM solo se conoce **después** de que termina, no antes.
+
+**Solución — dos fases, patrón de autorización bancaria:**
+
+1. **Pre-flight:** estimar costo máximo usando `max_tokens` (cota superior conocida de antemano) → reservar contra el budget → rechazar si no alcanza en **cualquier** nivel de la jerarquía.
+2. **Post-flight:** al recibir `usage` real, liberar la reserva y debitar el costo real (siempre ≤ estimado).
+
+**Streaming:** circuit breaker en vivo — el Cost Governor cuenta tokens emitidos en tiempo real y corta la conexión si se agota el budget a mitad de la respuesta, devolviendo resultado parcial marcado como truncado.
+
+**Jerarquía de budgets** (cada nivel es un gate independiente en pre-flight):
+
+```
+Organización → Team/Proyecto ($/mes) → Agente ($/hora, tokens/hora) → Llamada individual (max_tokens)
+```
+
+**Fallo en tarea colaborativa (RPC):** si el agente que procesa se queda sin budget a mitad de una llamada síncrona, el agente que espera recibe error inmediato — mismo patrón fail-fast que permisos y memoria, sin intervención automática.
+
+---
+
+## 12. Fuera de alcance del MVP (explícito, para no inflar el scope)
+
+- Marketplace de agentes
+- Migración de agentes entre servidores (live-migration)
+- Multi-tenancy y HA del Control Plane
+- GPU scheduling
+- Backups automatizados (MVP: dump manual de Postgres)
+- Modelo B de memoria compartida (publicación explícita)
+- Afinidad hard / verificación distribuida de permisos (sidecar OPA)
+
+---
+
+## 13. Optimizaciones de bajo nivel (v2+, evaluadas y con veredicto)
+
+Se evaluaron 4 propuestas de optimización extrema de densidad/latencia. Dos se adoptan con ajustes, dos se corrigen técnicamente antes de adoptar. Ninguna entra al MVP — todas asumen que el núcleo (Secciones 3-11) ya está funcionando y estable.
+
+### 13.1 Runtime Wasm como backend alternativo (no reemplazo de Docker)
+
+- **Adopción:** el Agent Runner soporta múltiples backends de aislamiento intercambiables (ya estaba previsto en la Sección 5 con Docker→Firecracker). Se añade **Wasm/WASI** como tercera opción, seleccionable por agente en `spec.runtime.isolation: wasm`.
+- **Por qué no reemplaza Docker en el MVP:** la mayoría de SDKs de LLM (OpenAI, Anthropic, etc.) son Python/Node con dependencias nativas que WASI no soporta bien todavía. Forzar Wasm ahora bloquearía a la mayoría de agentes reales.
+- **Cuándo usarlo:** agentes con lógica simple y determinística (filtros, validadores, transformadores de datos, agentes "ligeros" sin llamadas a librerías nativas) — ahí sí se logra el arranque en microsegundos y la densidad masiva descrita.
+- **Impacto en el Scheduler:** un nodo puede reportar dos pools de capacidad separados (`docker_slots`, `wasm_slots`); el most-allocated packing aplica por separado a cada uno.
+
+### 13.2 Shared Memory Fabric para agentes co-ubicados
+
+- **Adopción:** cuando el Scheduler coloca a Agente A y Agente B en el mismo nodo físico, el Control Plane puede asignar un segmento de memoria compartida (vía `mmap`/`shm`) para el paso de mensajes entre ellos, evitando serialización de red.
+- **Ajuste no negociable:** esto NO reemplaza el paso por Permission Engine ni la auditoría. El flujo sigue siendo: autorización primero (igual que hoy) → si se autoriza, el payload real se transfiere zero-copy → un **registro-sombra** (metadata: quién, cuándo, tamaño, hash del payload — no el payload completo) se escribe de forma asíncrona a JetStream para mantener el Audit Log completo sin bloquear la latencia del zero-copy.
+- **Alcance:** solo aplica intra-nodo. Entre nodos, sigue usándose NATS JetStream normal (Sección 7) — no hay excepción cross-máquina en el MVP ni en esta optimización.
+
+### 13.3 eBPF como capa de red adicional (no reemplazo del Permission Engine)
+
+- **Corrección técnica:** eBPF no puede evaluar políticas de negocio (roles, capabilities, budgets) porque opera a nivel de paquete/syscall, sin conocimiento del dominio de agentes. El Permission Engine (OPA, Sección 7) se mantiene como única autoridad de autorización de negocio.
+- **Adopción real:** eBPF se usa como **segunda línea de defensa a nivel de red**, vía Cilium o equivalente, para bloquear movimiento lateral a nivel de socket/syscall. Es defensa en profundidad, no sustituto de la lógica de permisos.
+- **Cuándo:** v2+, junto con la migración a Firecracker/gVisor.
+
+### 13.4 RDMA para acceso cross-servidor a Memoria Semántica — investigación v3
+
+- **No se adopta todavía.** Requiere NICs con soporte RDMA (RoCE/InfiniBand, o AWS EFA) no disponibles en infraestructura cloud commodity, y pgvector no expone un modo de acceso compatible con RDMA.
+- **Se registra como línea de investigación futura**, condicionada a que el volumen de consultas cross-servidor a Memoria Semántica se vuelva un cuello de botella medido. Antes de RDMA: réplicas de lectura de pgvector cerca de cada nodo, o cache de embeddings frecuentes en Working Memory.
+
+---
+
+## 14. Nomenclatura oficial y capacidades nuevas adoptadas
+
+### 14.1 Glosario (nombres oficiales, sin cambio funcional)
+
+HyperCore Kernel = Control Plane · Agent DNA = Agent Spec · Universal Runtime = Agent Runner · Zero-Copy Pipeline = Shared Memory Fabric (13.2) · Event Sourcing Core = Episodic Memory · Agent Image = `spec.runtime.image` + Marketplace · Capability Engine = Permission Engine · Self-Healing Engine = Reconciliation Loop (Sec. 8) · Digital Nervous System = Event Bus · Resource Hypervisor = Scheduler + Cost Governor · Security Fabric = Permission Engine + eBPF (13.3) + Identity Service.
+
+### 14.2 HyperCore BIOS — validación previa al registro
+
+Sub-paso explícito de `DRAFT → REGISTERED` (Sec. 8): verifica firma del Agent Image, integridad del manifiesto (Agent DNA), y que las capabilities solicitadas existan y estén aprobadas por el operador. Si falla, el agente nunca sale de `DRAFT`. No es un componente nuevo, es una responsabilidad formalizada del Control Plane.
+
+### 14.3 Memory Hierarchy (Hot/Warm/Cold/Archive) — resuelve Backups
+
+Extensión de la capa Episodic/Semantic (Sec. 10) con tiering físico por antigüedad/uso:
+- **Hot:** Redis (Working Memory, ya existente)
+- **Warm:** Postgres activo (Episodic/Semantic recientes)
+- **Cold:** Postgres particionado o object storage (S3-compatible), datos >90 días
+- **Archive:** snapshot comprimido, solo lectura, para agentes `ARCHIVED`
+
+Migración entre niveles es un job asíncrono del Control Plane, no bloquea al agente. Resuelve el backup del MVP ("dump manual") con una política de retención automática por antigüedad.
+
+### 14.4 Time Machine — resuelve Recuperación ante fallos
+
+Se construye sobre Event Sourcing Core (Episodic Memory, ya append-only por diseño): dado que cada acción ya es un evento inmutable, reconstruir el estado a un timestamp `T` es replay de eventos hasta `T`. No requiere Árboles de Merkle (evaluado y descartado por complejidad extra sin beneficio medible sobre un log append-only ya auditado) — la inmutabilidad ya viene del `INSERT`-only de Postgres.
+Rollback = marcar snapshot destino, re-crear namespace de Memory Plane desde ese punto, requiere aprobación humana explícita (consistente con fail-visible, nunca automático).
+
+### 14.5 Shadow Execution — mecanismo de versionado
+
+Al publicar `Agent v1.3.0` sobre un `v1.2.0` activo (`DEPRECATED`, Sec. 8): v1.3.0 corre en paralelo recibiendo una copia espejo del tráfico real (vía Event Bus, sin afectar respuestas en vivo), sus outputs se comparan/loguean, y solo se promueve a `ACTIVE` con aprobación humana. Resuelve el pendiente de "migración de memoria entre versiones": v1.3.0 lee el mismo namespace Semantic (compartido entre versiones del mismo agente) pero con su propio Working/Episodic hasta la promoción.
+
+### 14.6 HyperCore SDK — entregable, no arquitectura
+
+Librería oficial (Go + Python bindings) que envuelve: creación de Agent DNA, cliente del Runner, interfaz de plugin para Tool/IO Plane. Se diseña después de que el contrato de API pública (Sec. 15, pendiente) esté cerrado — depende de él, no al revés.
+
+### 14.7 Rechazados (con justificación)
+
+- **Intent Bus** (ruteo implícito por intención en vez de subject explícito): rompe la auditoría determinista de la Sec. 7 — quién recibe qué dejaría de ser predecible antes de tiempo de ejecución. No se adopta.
+- **Living Architecture** (el sistema modifica su propia arquitectura autónomamente): contradice el principio fail-fast/fail-visible (Sec. 2) — ninguna decisión estructural debe tomarse sin humano en el loop. Sustituto: Observability genera sugerencias, un humano las aprueba.
+
+---
+
+## 15. Fiabilidad distribuida y grafo de recursos (v2+)
+
+Renombres/confirmaciones sin cambio funcional: Agent Checkpoint Engine = checkpoint del lifecycle (Sec. 8) · Agent State Machine = lifecycle formal (Sec. 8) · Spec Compiler = HyperCore BIOS (14.2) · Plugin Sandbox = Tool/IO Plane · Kernel Extensions = patrón núcleo+microservicios (Sec. 5/9) · Memory Compaction = job de mantenimiento bajo Memory Hierarchy (14.3) · Resource Predictor = Predictive Scheduler (13, ya evaluado).
+
+### 15.1 Global Resource Graph — componente central nuevo
+
+Grafo en tiempo real (nodos = agentes, servidores, recursos; aristas = dependencias, comunicación autorizada, ubicación de memoria) mantenido por el Control Plane. El Scheduler, el Permission Engine y el Migration Engine lo consultan en vez de tomar decisiones con vista parcial. Se construye incrementalmente desde eventos del Event Bus (cada mensaje/checkpoint/reserva de recurso actualiza una arista) — no requiere infraestructura nueva, es una proyección sobre datos que ya se generan.
+
+### 15.2 Consensus Engine + Kernel Panic Recovery
+
+Cuando el Control Plane pasa a HA (multi-nodo, v2 — ver Sec. 5), usa **Raft** (vía etcd, ya listado como stack empresarial) para que las réplicas acuerden el estado. Kernel Panic Recovery es la consecuencia directa: si el nodo líder cae, Raft promueve una réplica en segundos sin detener el clúster. No es un componente separado.
+
+### 15.3 Agent Migration Engine
+
+Se construye sobre el Checkpoint existente: como la Memoria Semántica/Episódica ya vive centralizada (Postgres/pgvector, no node-local), "migrar" un agente es: checkpoint de Working Memory → Scheduler reprograma en nodo destino → restaura Working Memory → reanuda. Bajo costo de implementación porque reutiliza piezas ya diseñadas.
+
+### 15.4 Distributed Clock
+
+Hybrid Logical Clock (HLC, no TrueTime) para ordenar eventos entre nodos de forma consistente — necesario para que Time Machine (14.4) reconstruya estado correctamente cruzando servidores.
+
+### 15.5 Service Mesh (versión ligera)
+
+mTLS entre Control Plane/Scheduler/Permission Engine/Cost Governor usando certificados del Identity Service (ya existente, Sec. 4) — no se adopta Istio/Linkerd completo en el MVP/v2 para no añadir peso operativo; se reevalúa si el número de microservicios crece mucho.
+
+### 15.6 Adaptive Scheduler (acotado)
+
+Usa métricas históricas solo para ajustar el *score* de afinidad soft (Sec. 9) — nunca puede saltarse el gate del Cost Governor ni las reglas del Permission Engine. Todo ajuste queda logueado y es reversible manualmente.
+
+### 15.7 HyperCore Research Mode
+
+No es infraestructura nueva: reutiliza Shadow Execution (14.5) sobre un pool de nodos etiquetado como `research`, para probar Wasm/Firecracker/RDMA sin tocar el pool de producción.
+
+### 15.8 Rechazado
+
+**Runtime Optimizer autónomo** ("elimina cuellos de botella automáticamente"): mismo conflicto que Living Architecture (13/14) con el principio fail-fast/fail-visible (Sec. 2). Sustituto adoptado: genera recomendaciones vía Observability, requiere aprobación humana antes de aplicar cualquier cambio estructural.
+
+---
+
+## 16. ISA, compilación y límites de determinismo (v2+)
+
+### 16.1 Rechazo: VM/ISA/bytecode propios — se reutiliza Wasm
+
+Se evaluó construir un "Agent ISA", "HyperCore VM", "Agent Bytecode" e "HyperCore IR" propios. **Rechazado**: Wasm (ya adoptado en 13.1) ya es un ISA universal estandarizado, con bytecode portable y un IR maduro (target `wasm32` de LLVM). Construir el equivalente propio duplicaría años de ingeniería de la comunidad Wasm sin ventaja medible. HyperCore usa Wasm como su ISA/bytecode/IR — cero desarrollo nuevo en esta área.
+
+### 16.2 Confirmaciones y fusiones (sin trabajo nuevo)
+
+Kernel ABI = versionado semver documentado del contrato del Control Plane · Capability Bus = subjects internos restringidos sobre el Event Bus · Scheduler Pipeline = formalización de las etapas ya existentes (Sec. 9), filtrado de nodos paralelizable · Resource Fabric / Agent Fabric = Global Resource Graph (15.1) + Migration Engine (15.3) · Agent Compiler = HyperCore BIOS (14.2) · Kernel Telemetry = extensión de Observability: cada decisión de Scheduler/Permission Engine/Cost Governor emite traza OTel.
+
+### 16.3 Execution Planner + Dependency Resolver
+
+Función sobre el Global Resource Graph (15.1): antes de ejecutar un lote de agentes con dependencias declaradas (ej. Writer depende del output de Researcher), calcula orden topológico y evita bloqueos innecesarios. No requiere infraestructura nueva, es una consulta sobre el grafo ya existente.
+
+### 16.4 Memory Fabric — abstracción lógica, no memoria física unificada
+
+Se adopta solo el nivel de abstracción: el agente ya no necesita saber en qué servidor físico vive su memoria (esto ya lo da el Memory Plane con namespaces, Sec. 10). No se construye memoria compartida física distribuida (DSM) — ese problema de sistemas distribuidos (consistencia bajo partición) no tiene beneficio claro sobre namespaces + réplicas de lectura ya planeadas.
+
+### 16.5 Deterministic Runtime — límite documentado
+
+Determinismo se garantiza solo en la capa de **orquestación**: dado el mismo estado y evento de entrada, el Control Plane, Scheduler y Permission Engine siempre toman la misma decisión (necesario para que Time Machine, 14.4, funcione correctamente). El razonamiento del propio agente (llamada al LLM) **no es determinista por naturaleza** y no se promete que lo sea — documentar este límite evita expectativas falsas en el SDK.
+
+---
+
+## 17. Formato de datos, integridad y secretos (v2+)
+
+### 17.1 Zero-Copy con FlatBuffers
+
+El Event Bus deja de transportar JSON y usa **FlatBuffers** (formato de memoria plana, sin parsing). Habilita que el Shared Memory Fabric (13.2) pase un puntero `mmap` entre agentes co-ubicados sin serializar. Requiere un **schema registry** versionado (análogo al de Kafka) para que Audit Log y herramientas de debug puedan decodificar los binarios — sin esto, la auditoría (Sec. 2, principio no negociable) pierde legibilidad.
+
+### 17.2 Integridad en Spot Instances
+
+Al ejecutar el Runtime Layer en nodos spot (baratos, efímeros, pueden apagarse sin aviso): cada checkpoint de Working Memory a Postgres incluye un hash de integridad.
+- Si Working Memory es un blob único → SHA-256 simple.
+- Si tiene múltiples claves/chunks → **árbol de Merkle** sobre los chunks, permitiendo al Migration Engine (15.3) verificar y, si hace falta, reparar solo el chunk corrupto en vez de descartar todo el checkpoint.
+No reabre la decisión ya tomada en 14.4 (Time Machine no usa Merkle para el ledger histórico completo) — este es un uso acotado, solo para validar un checkpoint puntual tras una caída abrupta.
+
+### 17.3 Secretos JIT atados al Cost Governor — resuelve "Gestión de secretos"
+
+Las API keys que usa el Tool/IO Plane se emiten **just-in-time**, con TTL igual a la ventana de budget vigente (Sec. 11), vía un secret store con leases dinámicos (tipo Vault). Cuando el Cost Governor deniega en Fase 1 (budget agotado), dispara la revocación activa del lease — el secreto deja de ser válido de inmediato, sin esperar expiración pasiva. Esto ata la superficie de exposición de credenciales directamente al gobierno de costos ya construido, sin duplicar lógica de control.
+
+### 17.4 Prefetch paralelo de embeddings (no predictivo)
+
+Al llegar un mensaje a JetStream para un agente dormido (Sec. 8), el Control Plane dispara **en paralelo** con el cold-start del runtime: (a) el Scheduler coloca el runtime, (b) una consulta a pgvector trae los embeddings relevantes al contenido del mensaje hacia Redis (Working Memory). Ambos procesos corren simultáneos, no secuenciales — cuando el runtime está listo, la cache ya está tibia. Es paralelización, no predicción con modelo (evita el riesgo ya señalado en Predictive Scheduler, Sec. 13/15).
+
+---
+
+## 18. Seguridad avanzada: identidad, cifrado, red y auditoría inmutable (v2+)
+
+### 18.1 Atestación remota (dependiente de hardware)
+
+Al despertar un agente, el Control Plane exige verificación de integridad del binario/imagen antes de cargar memoria — vía vTPM del proveedor cloud (AWS Nitro Attestation, Azure Confidential VMs) o TPM físico on-prem. Donde el proveedor no lo soporte, fallback a verificación de hash de imagen (ya cubierto por HyperCore BIOS, 14.2) — más débil pero sin bloquear el despliegue. Se documenta como capacidad de "mejor esfuerzo según infraestructura", no garantía universal.
+
+### 18.2 Cifrado por sobres con Shamir para la clave maestra
+
+Semantic Memory (pgvector) se cifra en reposo con una **DEK** (Data Encryption Key) por agente. La **KEK** (clave maestra que protege las DEKs) se fragmenta con Shamir's Secret Sharing entre varios custodios — reconstrucción requiere umbral (ej. 3 de 5). El Permission Engine entrega la DEK temporal solo durante la sesión de ejecución activa (expira al terminar el runtime, Sec. 8); el descifrado ocurre transitoriamente en Working Memory, nunca en el store persistente. Evita el costo prohibitivo de fragmentar cada lectura individual, que sería incompatible con búsqueda por similitud vectorial en claro.
+
+### 18.3 Fencing de red con eBPF + excepción de Tool/IO Plane
+
+Cada Agent Runner queda restringido por eBPF (13.3) a un único socket: el del Event Bus. **Excepción necesaria:** el Tool/IO Plane mantiene un proxy de egress separado con allowlist explícita por herramienta (dominio, rate limit, logging obligatorio) — sin esto, ninguna herramienta externa (`web_search`, APIs) sería utilizable. El agente nunca tiene acceso directo a la red; toda salida pasa por ese proxy controlado, auditado igual que cualquier otra acción (Sec. 2).
+
+### 18.4 Ledger con hash-chain (Audit Log inmutable)
+
+Cada evento del Event Sourcing Core (Episodic Memory) se firma: `Hash_N = H(Mensaje_N + Hash_N-1)`. Más simple que el árbol de Merkle ya acotado en 17.2 (que es por-chunk, para verificar integridad de un checkpoint puntual) — aquí es una cadena lineal sobre el historial completo, suficiente para detectar cualquier alteración retroactiva sin el costo de mantener una estructura de árbol.
+
+---
+
+## 19. Pendiente de diseñar (próximas sesiones)
+
+- Versionado de agentes y migración de memoria entre versiones (`DEPRECATED` ya existe en el lifecycle, falta el detalle operativo)
+- Recuperación ante fallos y estrategia de backups
+- Contrato formal de API pública (REST/gRPC)
+- Marketplace de agentes
+- Panel Web (bajo riesgo de diseño, consumidor de la API)
+
+---
+
+## 20. Consolidación final — capa de cierre (Google/NVIDIA-grade, sin recortar funciones)
+
+Revisión final de las 3 dimensiones pedidas, aplicada como ajustes puntuales sobre lo ya diseñado — no se reabren decisiones, se refuerzan:
+
+### 20.1 Optimización extrema (sin límite de funciones)
+- Wasm (13.1) + Zero-Copy FlatBuffers (17.1) + Shared Memory Fabric (13.2) = ruta de latencia mínima intra-nodo ya cerrada.
+- Prefetch paralelo (17.4) + afinidad soft (Sec.9) + Memory Hierarchy (14.3) = cold-start minimizado sin sacrificar el modelo serverless.
+- Global Resource Graph (15.1) asegura que Scheduler/Migration Engine nunca decidan a ciegas — es la pieza que habilita optimización real a escala de clúster, no solo de nodo.
+- Bin-packing most-allocated (Sec.9) + Adaptive Scheduler acotado (15.6) = densidad tipo NVIDIA (maximizar uso de hardware encendido) sin autonomía descontrolada.
+
+### 20.2 Seguridad enterprise (defensa en profundidad, 5 capas)
+1. Identidad: atestación remota (18.1) + Identity Service + Kernel ABI versionado.
+2. Autorización: Permission Engine (capability-based) + eBPF de red (13.3/18.3) como segunda línea.
+3. Datos: envelope encryption + Shamir en KEK (18.2), namespace deny-by-default (Sec.10).
+4. Secretos: JIT atados al Cost Governor, revocación activa (17.3).
+5. Auditoría: hash-chain inmutable (18.4) + Time Machine (14.4) para rollback verificable.
+Principio que ata todo: fail-fast/fail-visible (Sec.2) — ninguna capa actúa de forma autónoma sin trazabilidad.
+
+### 20.3 Arquitectura de clase mundial, optimizando tokens
+- Cost Governor de dos fases (Sec.11) = único mecanismo del mercado que gobierna gasto de LLM con la misma disciplina que CPU/RAM.
+- Rechazos documentados (Intent Bus, Living Architecture, Runtime Optimizer autónomo, VM/ISA propio) evitan deuda técnica y gasto de ingeniería redundante — la disciplina de "reutilizar antes que reinventar" (Wasm en vez de VM propia) es en sí una optimización de recursos de construcción, no solo de runtime.
+- Todo componente nuevo de las rondas 13-19 se apoya en piezas ya existentes (Event Bus, Checkpoint, Identity Service) — costo de implementación incremental, no exponencial.
+
+## 21. Resumen ejecutivo de una página
+
+NÚCLEO: Control Plane (Go, reconciliation loop) + Scheduler (cost-gate→filtro→afinidad→cola) + Permission Engine (OPA, capability-based) + Cost Governor (reserva/débito 2 fases).
+RUNTIME: serverless on-demand, Docker (MVP) / Wasm (v2, ISA reutilizado) / Firecracker (enterprise), JetStream como trigger de despertar.
+MEMORIA: Working(Redis)/Episodic(Postgres,hash-chain)/Semantic(pgvector,cifrado por sobres) + tiering Hot/Warm/Cold/Archive.
+COMUNICACIÓN: NATS JetStream, roles no pares, FlatBuffers, shared memory zero-copy intra-nodo.
+SEGURIDAD: atestación remota + eBPF fencing + Shamir/envelope encryption + secretos JIT + ledger inmutable.
+FIABILIDAD: Consensus Engine (Raft) + Global Resource Graph + Time Machine + Migration/Checkpoint Engine.
+GOBERNANZA: fail-fast/fail-visible en todo el sistema; ninguna automatización estructural sin humano en el loop.
+PRODUCTO: API gRPC+REST gateway, Panel Web (3 vistas, sin lógica propia), Marketplace (vista sobre Agent Images versionados).

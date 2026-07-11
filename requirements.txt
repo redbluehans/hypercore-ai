@@ -1,0 +1,6 @@
+# Instalar con: pip install -r requirements.txt
+# El prototipo (fase0-fase7-db) NO necesita esto, corre con stdlib puro.
+# Esto es solo para hypercore-fase8-prod (Postgres + NATS reales).
+
+psycopg2-binary>=2.9    # driver Postgres
+nats-py>=2.6             # cliente NATS + JetStream

@@ -1,0 +1,21 @@
+name: hypercore-ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Fase 0 - Control Plane
+        run: |
+          cd hypercore-fase0
+          python3 main.py & sleep 1
+          python3 test_client.py
+          kill %1
+      - name: Fase 1 - Runtime + Memoria
+        run: cd hypercore-fase1 && python3 test_fase1.py
+      - name: Fase 2 - Permisos + Comunicación
+        run: cd hypercore-fase2 && python3 test_fase2.py
+      - name: Fase 3 - Cost Governor + Scheduler
+        run: cd hypercore-fase3 && python3 test_fase3.py

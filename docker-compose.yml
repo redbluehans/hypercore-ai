@@ -1,0 +1,40 @@
+# HyperCore AI - stack de infraestructura (Sec.3 del documento de arquitectura)
+# docker compose up -d
+version: "3.9"
+
+services:
+  control-plane:
+    build: .
+    ports: ["8080:8080"]
+    depends_on: [postgres, nats]
+    env_file: .env
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M}   # gate real de recursos, no solo lógico
+
+  postgres:
+    image: pgvector/pgvector:pg16    # Episodic (append-only) + Semantic (embeddings), Sec.10
+    env_file: .env                    # nunca hardcodear credenciales (ver .env.example)
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine            # Working Memory / cache de nodo, Sec.10
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+
+  nats:
+    image: nats:2-alpine             # Event Bus, JetStream habilitado (Sec.7/8)
+    command: ["-js", "-sd", "/data"]
+    volumes: ["natsdata:/data"]
+    ports: ["4222:4222"]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest   # Observability, Sec.4 (estándar, no reinventar)
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  natsdata:
